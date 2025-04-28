@@ -14,8 +14,15 @@ from __future__ import print_function, absolute_import
 import subprocess, sys, os
 from numpy import *
 from scipy import *
-from math import *
+import math
 import numpy as np
+import rdkit
+from rdkit import Chem
+from typing import Union
+import pandas as pd
+import glob
+from joblib import Parallel, delayed
+
 #from vpython import *
 
 #Chemistry Libaries
@@ -491,6 +498,164 @@ class calcSterimol:
       if linearcheck(twodcarts)==1:self.B1 = max(fragrad)
       elif len(vlist) > 0: self.B1=min(vlist)
       else: self.B1 = max(fragrad)
+
+class calcSterimolrdkit:
+   def __init__(self, mol, radii, atomA, atomB,verbose):
+
+    #   if len(file.split(".com"))>1 or len(file.split(".gjf"))>1: fileData = getinData(file.split(".")[0])
+    #   if len(file.split(".out"))>1 or len(file.split(".log"))>1: fileData = getoutData(file.split(".")[0])
+      fileData = getrdkitData(mol)
+
+      # initialize the array of atomic vdw radii
+      molcart = fileData.CARTESIANS; atomtype = fileData.ATOMTYPES; natoms = len(molcart); vdw_radii = []
+
+      if radii == "cpk":
+         atomic_co_no = ncoord(natoms, rcov, atomtype, molcart)
+         sterimol_types = generate_atom_types(atomtype, atomic_co_no)
+         #print sterimol_types
+         for i in range(0,natoms):
+            for j in range(0,len(sterimol_atomtypes)):
+               if sterimol_types[i] == sterimol_atomtypes[j]: vdw_radii.append(cpk_radii[j]/100.00)
+
+      if radii == "bondi":
+         for i in range(0,natoms): vdw_radii.append(bondiRadius(periodictable.index(fileData.ATOMTYPES[i])))
+
+# Define vector along the L-axis connecting base atom and the next attached atom
+# subtract one since the array starts from zero not one
+      atomA = atomA - 1; atomB = atomB - 1
+      next_atom = molcart[atomB]
+      vect1=np.subtract(getcoords(atomA,molcart),next_atom)
+      if verbose == True:
+          print("   Atoms", atomA, "and", atomB, "define the L-axis and direction", vect1)
+
+          print("\n", "   Atom ".ljust(9), "  Xco/A".rjust(9), "  Yco/A".rjust(9), "  Zco/A".rjust(9), " VdW/pm".rjust(9))
+          print("   ##############################################")
+      # Remove the base atom from the list of atoms to be considered for sterics (after printing all)
+      atomlist = list(range(0,natoms))
+      if verbose == True:
+          for atom in atomlist:
+             if radii == "cpk": print("  ", sterimol_types[atom].ljust(6), end=' ')
+             if radii == "bondi": print("  ", atomtype[atom].ljust(6), end=' ')
+             for coord in molcart[atom]:
+                if coord < 0.0: print("   %.3f".rjust(6) % coord, end=' ')
+                else: print("    %.3f".rjust(6) % coord, end=' ')
+             print("    %.1f" % round(vdw_radii[atom]*100))
+      atomlist.remove(atomA)
+
+      adjlist=[]; opplist=[]; theta=[]
+      for i in atomlist:
+         vect2=np.subtract(getcoords(atomA,molcart),getcoords(i,molcart))
+         oppdist=calcopposite(atomA,i,angle(vect1,vect2),molcart)
+         opplist.append(oppdist+vdw_radii[i])
+         adjdist=calcadj(atomA,i,angle(vect1,vect2),molcart)
+         #minadjlist.append(adjdist-vdw_radii[i])
+         adjlist.append(adjdist+vdw_radii[i])
+
+      B5=max(opplist)
+   #self.lval=max(adjlist)-minval
+   # A bit weird, but seems like original sterimol adds on the difference between the bond length and vdw radius of atom B. For a C-H bond this is 1.50 - 1.10 = 0.40 Angstrom)
+      self.lval=max(adjlist)+0.40
+
+      ###Useful - do not delete!
+      #print "   B5 atom", atomlist[opplist.index(max(opplist))]+1, "distance", max(opplist)
+      #print "   Highest atom", atomlist[adjlist.index(max(adjlist))]+1,"distance", max(adjlist),"\n   Lowest atom", atomlist[minadjlist.index(min(minadjlist))]+1,"distance", min(minadjlist)
+
+      zcarts=[]#zeroed carts
+      for i in atomlist: zcarts.append(np.subtract(molcart[i],molcart[atomA]))
+      zvect=[0,0,1]
+      zcent=np.subtract(next_atom,molcart[atomA])
+      for cart in range(len(zcarts)):
+         zcoord= rotrel(zcent,zvect,zcarts[cart])
+         zcarts[cart]=zcoord
+      twodcarts=[]
+      for row in zcarts: twodcarts.append([row[0],row[1]])
+      fragrad=[]#radii of fragment atoms
+      for t in atomlist: fragrad.append(vdw_radii[t])
+      singledist=[]
+      for t in range(len(fragrad)):
+         d=np.linalg.norm(twodcarts[t])#;print d
+         d=d+fragrad[t]
+         singledist.append(d)
+      self.newB5=max(singledist) #This is the same as the 3D calculated value from above
+
+      center=[0,0]
+      vlist=[]#list of distances from the origin to the tangential vectors
+      alist=[]#list of atoms between which the tangential vectors pass through no other atoms
+      iav=[]#interatomic vectors
+      sym=symcheck(twodcarts)
+      for x in range(len(twodcarts)):
+         if sym==1:
+            twodcarts[x][0]=twodcarts[x][0]+0.000001
+            twodcarts[x][1]=twodcarts[x][1]+0.000001
+         for y in range(len(twodcarts)):
+            if x!=y:
+               try:nvect= (twod_vect(center,twodcarts[x],twodcarts[y]))#origin normal vector to connecting atomic centers vector
+               except ValueError:nvect=[0,0]
+               iav=np.subtract(twodcarts[x],twodcarts[y])#interatomic vector
+               iad=np.linalg.norm(iav)#interatomic distance
+               try:theta=math.asin((fragrad[y]-fragrad[x])/iad)#calculates angle by which to rotate vdw radii before adding
+               except ValueError: theta=np.pi/2
+               try:unvect=nvect/np.linalg.norm(nvect)
+               except RuntimeWarning:pass#unvect=[0,0]
+               xradv=twod_rot(unvect*fragrad[x],theta)
+               yradv=twod_rot(unvect*fragrad[y],theta)
+               mvect= (twod_vect(center,twodcarts[x]-xradv,twodcarts[y]-yradv))
+               nvect= (twod_vect(center,twodcarts[x]+xradv,twodcarts[y]+yradv))#origin normal vector to connecting atomic surfaces tangential vector
+               newx=twodcarts[x]+xradv
+               newy=twodcarts[y]+yradv
+               mewx=twodcarts[x]-xradv
+               mewy=twodcarts[y]-yradv
+               if np.cross(nvect,xradv)<0.000000001 and theta!=np.pi/2:
+                  satpoint=[]#Satisfied points not within range of tangential vector
+                  for z in range(len(twodcarts)):
+                     pvdist=twod_dist(twodcarts[z],newx,newy)
+                     if z!=x and z!=y and pvdist>(fragrad[z]-0.0001):satpoint.append(pvdist)
+                  if len(satpoint)==len(atomlist)-2:vlist.append(np.linalg.norm(nvect));alist.append([x,y]);#print x,y
+                  satpoint=[]
+                  for z in range(len(twodcarts)):
+                     pvdist=twod_dist(twodcarts[z],mewx,mewy)
+                     if z!=x and z!=y and pvdist>(fragrad[z]-0.0001):satpoint.append(pvdist)
+                  if len(satpoint)==len(atomlist)-2:vlist.append(np.linalg.norm(mvect));alist.append([x,y])
+      if linearcheck(twodcarts)==1:self.B1 = max(fragrad)
+      elif len(vlist) > 0: self.B1=min(vlist)
+      else: self.B1 = max(fragrad)
+
+class getrdkitData():
+    def __init__(self, mol: rdkit.Chem.rdchem.Mol):
+        self.CARTESIANS = self._getcartesians(mol)
+        self.ATOMTYPES = self._getatomtypes(mol)
+
+    def _getcartesians(self, mol):
+        confs = mol.GetConformers()
+        if len(confs) != 1:
+            raise ValueError('Multiple conformers found for mol object!')
+        else:
+           return confs[0].GetPositions()
+    
+    def _getatomtypes(self, mol):
+       return [x.GetSymbol() for x in mol.GetAtoms()]
+
+def getMolObject(sdf_file: Union[os.PathLike, str]) -> rdkit.Chem.rdchem.Mol:
+    return(Chem.SDMolSupplier(sdf_file)[0])
+
+def calcSterimolsdf(sdf_file):
+   sid = os.path.basename(sdf_file)[:-4].split('_')[0]
+   mol = getMolObject(sdf_file = sdf_file)
+   st = calcSterimolrdkit(mol,
+                          radii = 'cpk',
+                          atomA = 1,
+                          atomB = 2,
+                          verbose = False)
+   return (sid, {'lval': st.lval,
+                  'B1': st.B1,
+                  'B5': st.newB5})
+
+def calcBulkSterimols(data_dir: Union[os.PathLike, str],
+                      nprocs: int = 1):
+    file_list = glob.glob(os.path.join(data_dir, '*.sdf'))
+    sts = Parallel(n_jobs=nprocs)(delayed(calcSterimolsdf)(x) for x in file_list)
+    sts = pd.DataFrame({key: value for (key, value) in sts}).transpose()
+    sts.to_csv(os.path.join(data_dir, 'sterimols_processed.csv'))
 
 def symcheck(carts):#Add symmetry criteria
    center=[0,0]
