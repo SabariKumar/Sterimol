@@ -643,8 +643,8 @@ def calcSterimolsdf(sdf_file):
    mol = getMolObject(sdf_file = sdf_file)
    st = calcSterimolrdkit(mol,
                           radii = 'cpk',
-                          atomA = 1,
-                          atomB = 2,
+                          atomA = 1, # Note that Sterimol numbering starts at 1! 1 here refers to 
+                          atomB = 2, # atom 0 in rdkit mol
                           verbose = False)
    return (sid, {'lval': st.lval,
                   'B1': st.B1,
